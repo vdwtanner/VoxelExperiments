@@ -528,7 +528,9 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: f56fa08407635c644bf27b8608e89ffb, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  rain: 1
   propogationDelay: 0.1
+  timeToSettle: 5
   voxelPrefabs:
   - {fileID: 7010099702756033412, guid: d796f680c072ede4cb8667ccd3dae1a3, type: 3}
   - {fileID: 4704220675619527497, guid: c7d0d1f3ce503b042ae34b47925e7cbb, type: 3}
