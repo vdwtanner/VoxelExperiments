@@ -1,24 +1,40 @@
-﻿using System.Collections;
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
 using Unity.Jobs;
 using Unity.Collections;
 
+using Profiler = UnityEngine.Profiling.Profiler;
+
 [RequireComponent(typeof(MeshFilter))]
 public class VoxelLiquid : MonoBehaviour
 {
+	const int INITIAL_VOXEL_CAPACITY = 256;
+	const float CAPACITY_SCALING_FACTOR = 1.5f;
+
 	public float propogationDelay = 1.0f;
 	public GameObject[] voxelPrefabs = new GameObject[7];
 
 	private Dictionary<Vector3, LiquidVoxel> waterVoxels;
 	private Dictionary<Vector3, LiquidVoxel> writeVoxels;
 	private float lastPropogationTime;
-	private NativeArray<float> heightLookup;
 
 	private MeshFilter meshFilter;
 	private Mesh mesh;
 
 	private List<GameObject> voxelGobs;
+
+	private bool meshUpdated = false;
+
+	#region meshingJob fields
+	private JobHandle meshingJobHandle;
+	private NativeArray<float> heightLookup;
+
+	private NativeHashMap<Vector3, LiquidVoxel> nhmVoxelMap;
+	private NativeArray<Vector3> verts;
+	private NativeArray<Vector3> normals;
+	private NativeArray<int> tris;
+	private NativeArray<int> counts;
+	#endregion
 
 	private void Awake()
 	{
@@ -31,6 +47,13 @@ public class VoxelLiquid : MonoBehaviour
 		heightLookup[5] = 0.7142857f;
 		heightLookup[6] = 0.8571429f;
 		heightLookup[7] = 1f;
+
+		counts = new NativeArray<int>(3, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+
+		nhmVoxelMap = new NativeHashMap<Vector3, LiquidVoxel>(INITIAL_VOXEL_CAPACITY, Allocator.Persistent);
+		verts = new NativeArray<Vector3>(INITIAL_VOXEL_CAPACITY * 24, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+		normals = new NativeArray<Vector3>(INITIAL_VOXEL_CAPACITY * 24, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+		tris = new NativeArray<int>(INITIAL_VOXEL_CAPACITY * 36, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
 	}
 
 	// Start is called before the first frame update
@@ -61,7 +84,13 @@ public class VoxelLiquid : MonoBehaviour
     // Update is called once per frame
     void Update()
     {
-        if(Time.time - lastPropogationTime >= propogationDelay)
+		if(meshingJobHandle.IsCompleted && !meshUpdated)
+		{
+			UpdateMesh();
+			return;
+		}
+
+        if(meshingJobHandle.IsCompleted && Time.time - lastPropogationTime >= propogationDelay)
 		{
 			Propagate();
 			lastPropogationTime = Time.time;
@@ -70,13 +99,21 @@ public class VoxelLiquid : MonoBehaviour
 
 	private void OnDestroy()
 	{
+		meshingJobHandle.Complete();
+		
 		heightLookup.Dispose();
+		nhmVoxelMap.Dispose();
+		verts.Dispose();
+		normals.Dispose();
+		tris.Dispose();
+		counts.Dispose();
 	}
 
 	private void Propagate()
 	{
+		Profiler.BeginSample("Propagate()");
 		bool changed = false;
-		if (Random.Range(0f, 1f) > .3f)
+		if (Random.Range(0f, 1f) > .1f)
 		{
 			Vector3 pos = new Vector3(Random.Range(0, 10), 8, Random.Range(0, 10));
 			if(!waterVoxels.ContainsKey(pos))
@@ -114,35 +151,36 @@ public class VoxelLiquid : MonoBehaviour
 		{
 			Remesh();
 		}
+		Profiler.EndSample();
 	}
 
 	public void Remesh()
 	{
-		/*foreach(GameObject gob in voxelGobs)
+		Profiler.BeginSample("Remesh()");
+		meshUpdated = false;
+
+		if(waterVoxels.Count > nhmVoxelMap.Capacity)
 		{
-			Destroy(gob);
+			//Scale up to meet the new need
+			DisposeOfSizeDependentJobCollections();
+			int newCapacity = (int)(waterVoxels.Count * CAPACITY_SCALING_FACTOR);
+			Debug.LogWarning($"Scaling up VoxelLiquid capacity! New capacity is {newCapacity} voxels.");
+
+			nhmVoxelMap = new NativeHashMap<Vector3, LiquidVoxel>(newCapacity, Allocator.Persistent);
+			verts = new NativeArray<Vector3>(newCapacity * 24, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+			normals = new NativeArray<Vector3>(newCapacity * 24, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+			tris = new NativeArray<int>(newCapacity * 36, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
 		}
-		voxelGobs.Clear();
 
-		//List<Vector3> verts = new List<Vector3>();
-		//List<int> tris = new List<int>();
+		//Only need to clear the voxel map before adding new voxel values. All other arrays will be overwritten
+		nhmVoxelMap.Clear();
 
+		Profiler.BeginSample("Copy voxels");
 		foreach (var tuple in waterVoxels)
-		{
-			voxelGobs.Add(GameObject.Instantiate(voxelPrefabs[tuple.Value.Volume-1], tuple.Key, Quaternion.identity));
-		}*/
-
-		NativeHashMap<Vector3, LiquidVoxel> nhmVoxelMap = new NativeHashMap<Vector3, LiquidVoxel>(waterVoxels.Count, Allocator.TempJob);
-		foreach(var tuple in waterVoxels)
 		{
 			nhmVoxelMap.TryAdd(tuple.Key, tuple.Value);
 		}
-
-		NativeArray<Vector3> verts = new NativeArray<Vector3>(waterVoxels.Count * 24, Allocator.TempJob);
-		NativeArray<Vector3> normals = new NativeArray<Vector3>(waterVoxels.Count * 24, Allocator.TempJob);
-
-		NativeArray<int> tris = new NativeArray<int>(waterVoxels.Count * 36, Allocator.TempJob);
-		NativeArray<int> counts = new NativeArray<int>(3, Allocator.TempJob);
+		Profiler.EndSample();
 
 		VoxelLiquidMeshingJob meshingJob = new VoxelLiquidMeshingJob
 		{
@@ -154,23 +192,33 @@ public class VoxelLiquid : MonoBehaviour
 			counts = counts
 		};
 
-		meshingJob.Schedule().Complete();
+		meshingJobHandle = meshingJob.Schedule();
+		Profiler.EndSample();
+	}
 
-		int vertCount = meshingJob.counts[0];
-		int triCount = meshingJob.counts[1];
+	private void UpdateMesh()
+	{
+		meshingJobHandle.Complete();
+
+		int vertCount = counts[0];
+		int triCount = counts[1];
 
 		mesh.Clear();
-		mesh.vertices = meshingJob.verts.Slice(0, vertCount).ToArray();
-		mesh.triangles = meshingJob.tris.Slice(0, triCount).ToArray();
-		mesh.normals = meshingJob.normals.Slice(0, counts[2]).ToArray();
+		mesh.vertices = verts.Slice(0, vertCount).ToArray();
+		mesh.triangles = tris.Slice(0, triCount).ToArray();
+		mesh.normals = normals.Slice(0, counts[2]).ToArray();
+		meshUpdated = true;
+	}
+
+	private void DisposeOfSizeDependentJobCollections()
+	{
+		meshingJobHandle.Complete();
 
 		nhmVoxelMap.Dispose();
 		verts.Dispose();
-		tris.Dispose();
-		counts.Dispose();
 		normals.Dispose();
+		tris.Dispose();
 	}
-
 
 	private bool TryPropagateDown(Vector3 pos, LiquidVoxel voxel)
 	{
@@ -384,6 +432,7 @@ public struct VoxelLiquidMeshingJob : IJob
 	{
 		counts[0] = 0;
 		counts[1] = 0;
+		counts[2] = 0;
 		NativeArray<Vector3> keys = voxels.GetKeyArray(Allocator.Temp);
 		foreach(Vector3 pos in keys)
 		{
@@ -394,6 +443,8 @@ public struct VoxelLiquidMeshingJob : IJob
 			MeshBack(pos, voxels[pos]);
 			MeshBottom(pos, voxels[pos]);
 		}
+
+		keys.Dispose();
 	}
 
 	private void MeshTop(Vector3 pos, LiquidVoxel voxel)
