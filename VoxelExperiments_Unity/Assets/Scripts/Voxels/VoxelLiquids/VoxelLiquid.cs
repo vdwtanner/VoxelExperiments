@@ -9,13 +9,12 @@ using Profiler = UnityEngine.Profiling.Profiler;
 public class VoxelLiquid : MonoBehaviour
 {
 	const int INITIAL_VOXEL_CAPACITY = 256;
-	const float CAPACITY_SCALING_FACTOR = 1.5f;
 
 	public float propogationDelay = 1.0f;
 	public GameObject[] voxelPrefabs = new GameObject[7];
 
-	private Dictionary<Vector3, LiquidVoxel> waterVoxels;
-	private Dictionary<Vector3, LiquidVoxel> writeVoxels;
+	private NativeHashMap<Vector3, LiquidVoxel> waterVoxels;
+	private NativeHashMap<Vector3, LiquidVoxel> writeVoxels;
 	private float lastPropogationTime;
 
 	private MeshFilter meshFilter;
@@ -26,10 +25,11 @@ public class VoxelLiquid : MonoBehaviour
 	private bool meshUpdated = false;
 
 	#region meshingJob fields
+	private int previousCapacity;
+
 	private JobHandle meshingJobHandle;
 	private NativeArray<float> heightLookup;
 
-	private NativeHashMap<Vector3, LiquidVoxel> nhmVoxelMap;
 	private NativeArray<Vector3> verts;
 	private NativeArray<Vector3> normals;
 	private NativeArray<int> tris;
@@ -50,26 +50,28 @@ public class VoxelLiquid : MonoBehaviour
 
 		counts = new NativeArray<int>(3, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
 
-		nhmVoxelMap = new NativeHashMap<Vector3, LiquidVoxel>(INITIAL_VOXEL_CAPACITY, Allocator.Persistent);
+		waterVoxels = new NativeHashMap<Vector3, LiquidVoxel>(INITIAL_VOXEL_CAPACITY, Allocator.Persistent);
+		writeVoxels = new NativeHashMap<Vector3, LiquidVoxel>(INITIAL_VOXEL_CAPACITY, Allocator.Persistent);
+
 		verts = new NativeArray<Vector3>(INITIAL_VOXEL_CAPACITY * 24, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
 		normals = new NativeArray<Vector3>(INITIAL_VOXEL_CAPACITY * 24, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
 		tris = new NativeArray<int>(INITIAL_VOXEL_CAPACITY * 36, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+
+		previousCapacity = INITIAL_VOXEL_CAPACITY;
 	}
 
 	// Start is called before the first frame update
 	void Start()
     {
 		voxelGobs = new List<GameObject>();
-		waterVoxels = new Dictionary<Vector3, LiquidVoxel>();
-		writeVoxels = new Dictionary<Vector3, LiquidVoxel>();
 
-		waterVoxels.Add(new Vector3(0, 1, 0), new LiquidVoxel(1, 7));
-		waterVoxels.Add(new Vector3(0, 3, 0), new LiquidVoxel(1, 2));
-		waterVoxels.Add(new Vector3(0, 5, 0), new LiquidVoxel(1, 2));
-		waterVoxels.Add(new Vector3(0, 7, 0), new LiquidVoxel(1, 4));
-		waterVoxels.Add(new Vector3(0, 9, 0), new LiquidVoxel(1, 1));
+		waterVoxels.TryAdd(new Vector3(0, 1, 0), new LiquidVoxel(1, 7));
+		waterVoxels.TryAdd(new Vector3(0, 3, 0), new LiquidVoxel(1, 2));
+		waterVoxels.TryAdd(new Vector3(0, 5, 0), new LiquidVoxel(1, 2));
+		waterVoxels.TryAdd(new Vector3(0, 7, 0), new LiquidVoxel(1, 4));
+		waterVoxels.TryAdd(new Vector3(0, 9, 0), new LiquidVoxel(1, 1));
 
-		waterVoxels.Add(new Vector3(2, 9, 1), new LiquidVoxel(1, 7));
+		waterVoxels.TryAdd(new Vector3(2, 9, 1), new LiquidVoxel(1, 7));
 
 		lastPropogationTime = Time.time;
 
@@ -100,9 +102,12 @@ public class VoxelLiquid : MonoBehaviour
 	private void OnDestroy()
 	{
 		meshingJobHandle.Complete();
-		
+
 		heightLookup.Dispose();
-		nhmVoxelMap.Dispose();
+
+		waterVoxels.Dispose();
+		writeVoxels.Dispose();
+
 		verts.Dispose();
 		normals.Dispose();
 		tris.Dispose();
@@ -118,17 +123,39 @@ public class VoxelLiquid : MonoBehaviour
 			Vector3 pos = new Vector3(Random.Range(0, 10), 8, Random.Range(0, 10));
 			if(!waterVoxels.ContainsKey(pos))
 			{
-				waterVoxels.Add(pos, new LiquidVoxel(1, 7));
+				waterVoxels.TryAdd(pos, new LiquidVoxel(1, 7));
 				changed = true;
 			}
 		}
 
 		writeVoxels.Clear();
-		foreach(var tuple in waterVoxels)
+		var positions = waterVoxels.GetKeyArray(Allocator.Temp);
+		foreach(Vector3 pos in positions)
 		{
-			Vector3 pos = tuple.Key;
-			LiquidVoxel voxel = tuple.Value;
-			if(TryPropagateDown(pos, voxel))
+			LiquidVoxel voxel = waterVoxels[pos];
+			Profiler.BeginSample("TryPropagateDown()");
+			bool propagatedDown = TryPropagateDown(pos, voxel);
+			Profiler.EndSample();
+
+			if (propagatedDown)
+			{
+				changed = true;
+				continue;
+			}
+
+			Profiler.BeginSample("TryPropagateOut()");
+			bool propagatedOut = TryPropagateOut(pos, voxel);
+			Profiler.EndSample();
+
+			if (propagatedOut)
+			{
+				changed = true;
+				continue;
+			}
+
+			SetWriteVoxel(pos, GetVoxelAt(pos));
+
+			/*if(TryPropagateDown(pos, voxel))
 			{
 				changed = true;
 				continue;
@@ -142,9 +169,10 @@ public class VoxelLiquid : MonoBehaviour
 			{
 				SetWriteVoxel(pos, GetVoxelAt(pos));
 			}
+			*/
 		}
 
-		Dictionary<Vector3, LiquidVoxel> temp = waterVoxels;
+		NativeHashMap<Vector3, LiquidVoxel> temp = waterVoxels;
 		waterVoxels = writeVoxels;
 		writeVoxels = temp;
 		if (changed)
@@ -159,33 +187,24 @@ public class VoxelLiquid : MonoBehaviour
 		Profiler.BeginSample("Remesh()");
 		meshUpdated = false;
 
-		if(waterVoxels.Count > nhmVoxelMap.Capacity)
+		if(waterVoxels.Capacity > previousCapacity)
 		{
+			previousCapacity = waterVoxels.Capacity;
 			//Scale up to meet the new need
 			DisposeOfSizeDependentJobCollections();
-			int newCapacity = (int)(waterVoxels.Count * CAPACITY_SCALING_FACTOR);
-			Debug.LogWarning($"Scaling up VoxelLiquid capacity! New capacity is {newCapacity} voxels.");
+			Debug.LogWarning($"Scaling up VoxelLiquid capacity! New capacity is {waterVoxels.Capacity} voxels.");
 
-			nhmVoxelMap = new NativeHashMap<Vector3, LiquidVoxel>(newCapacity, Allocator.Persistent);
-			verts = new NativeArray<Vector3>(newCapacity * 24, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-			normals = new NativeArray<Vector3>(newCapacity * 24, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-			tris = new NativeArray<int>(newCapacity * 36, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+			writeVoxels = new NativeHashMap<Vector3, LiquidVoxel>(waterVoxels.Capacity, Allocator.Persistent);	//Go ahead and scale up this boi for the next write
+			verts = new NativeArray<Vector3>(previousCapacity * 24, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+			normals = new NativeArray<Vector3>(previousCapacity * 24, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+			tris = new NativeArray<int>(previousCapacity * 36, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
 		}
 
-		//Only need to clear the voxel map before adding new voxel values. All other arrays will be overwritten
-		nhmVoxelMap.Clear();
-
-		Profiler.BeginSample("Copy voxels");
-		foreach (var tuple in waterVoxels)
-		{
-			nhmVoxelMap.TryAdd(tuple.Key, tuple.Value);
-		}
-		Profiler.EndSample();
 
 		VoxelLiquidMeshingJob meshingJob = new VoxelLiquidMeshingJob
 		{
 			heightLookup = heightLookup,
-			voxels = nhmVoxelMap,
+			voxels = waterVoxels,
 			verts = verts,
 			tris = tris,
 			normals = normals,
@@ -198,6 +217,7 @@ public class VoxelLiquid : MonoBehaviour
 
 	private void UpdateMesh()
 	{
+		Profiler.BeginSample("UpdateMesh()");
 		meshingJobHandle.Complete();
 
 		int vertCount = counts[0];
@@ -208,13 +228,15 @@ public class VoxelLiquid : MonoBehaviour
 		mesh.triangles = tris.Slice(0, triCount).ToArray();
 		mesh.normals = normals.Slice(0, counts[2]).ToArray();
 		meshUpdated = true;
+
+		Profiler.EndSample();
 	}
 
 	private void DisposeOfSizeDependentJobCollections()
 	{
 		meshingJobHandle.Complete();
 
-		nhmVoxelMap.Dispose();
+		writeVoxels.Dispose();
 		verts.Dispose();
 		normals.Dispose();
 		tris.Dispose();
@@ -343,21 +365,45 @@ public class VoxelLiquid : MonoBehaviour
 
 	private void SetWriteVoxel(Vector3 pos, LiquidVoxel voxel)
 	{
+		Profiler.BeginSample("SetWriteVoxel()");
 		if (writeVoxels.ContainsKey(pos))
 			writeVoxels[pos] = voxel;
 		else
-			writeVoxels.Add(pos, voxel);
+		{
+			writeVoxels.TryAdd(pos, voxel);
+		}
+		Profiler.EndSample();
 	}
 
 	private LiquidVoxel GetVoxelAt(Vector3 pos)
 	{
-		if (writeVoxels.TryGetValue(pos, out LiquidVoxel newVoxel))
-			return newVoxel;
+		Profiler.BeginSample("GetVoxelAt()");
+		LiquidVoxel result;
 
-		if (waterVoxels.TryGetValue(pos, out LiquidVoxel existingVoxel))
-			return existingVoxel;
+		Profiler.BeginSample("writeVoxels.TryGetValue()");
+		bool writeVoxelFound = writeVoxels.TryGetValue(pos, out result);
+		Profiler.EndSample();
+		if (writeVoxelFound)
+		{
+			//return newVoxel;
+		}
+		else
+		{
+			Profiler.BeginSample("waterVoxels.TryGetValue()");
+			bool waterVoxelFound = waterVoxels.TryGetValue(pos, out result);
+			Profiler.EndSample();
+			if (waterVoxelFound)
+			{
+				//return existingVoxel;
+			}
+			else
+			{
+				result = AskWorldForVoxel(pos);
+			}
+		}
 
-		return AskWorldForVoxel(pos);
+		Profiler.EndSample();
+		return result;
 	}
 
 	LiquidVoxel AskWorldForVoxel(Vector3 location)
